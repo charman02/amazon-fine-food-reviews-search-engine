@@ -1,8 +1,0 @@
-path = kagglehub.dataset_download("snap/amazon-fine-food-reviews")
-print("Path to dataset files:", path)
-
-reviews = pd.read_csv('/root/.cache/kagglehub/datasets/snap/amazon-fine-food-reviews/versions/2/Reviews.csv')
-reviews.head()
-
-reviews = reviews.drop(['Id', 'UserId', 'ProfileName', 'HelpfulnessNumerator', 'HelpfulnessDenominator','Time'], axis=1)
-reviews.head()
