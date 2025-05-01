@@ -1,0 +1,267 @@
+IF THERE IS A SPACE BETWEEN LINES == RUN IN A SEPARATE CELL
+
+#Installing necessary libraries
+
+!pip install kagglehub
+
+!wget -q https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-oss-7.9.2-linux-x86_64.tar.gz
+!wget -q https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-oss-7.9.2-linux-x86_64.tar.gz.sha512
+!tar -xzf elasticsearch-oss-7.9.2-linux-x86_64.tar.gz
+!sudo chown -R daemon:daemon elasticsearch-7.9.2/
+!shasum -a 512 -c elasticsearch-oss-7.9.2-linux-x86_64.tar.gz.sha512
+
+# https://stackoverflow.com/questions/68762774/elasticsearchunsupportedproducterror-the-client-noticed-that-the-server-is-no#answer-68918449
+!pip install elasticsearch==7.9.1 -q
+
+# check elasticsearch version in environment
+!pip freeze | grep elasticsearch
+
+!pip install --upgrade numpy==1.24.3
+
+%%bash --bg
+sudo -H -u daemon elasticsearch-7.9.2/bin/elasticsearch
+
+%%bash
+ps -ef | grep elasticsearch
+
+#Importing necessary packages
+import re
+import nltk
+from nltk.stem import WordNetLemmatizer
+from nltk import word_tokenize
+from sklearn.feature_extraction.text import CountVectorizer
+from tqdm import tqdm
+import kagglehub
+from elasticsearch import Elasticsearch
+from elasticsearch.exceptions import ElasticsearchException
+from elasticsearch.helpers import bulk
+import time
+import pandas as pd
+import spacy
+import string
+from sklearn.feature_extraction.text import CountVectorizer
+
+
+# start es server
+time.sleep(20) # give the server 20 seconds to start
+!curl -X GET "http://localhost:9200"
+
+#Get, load and visualise Dataset 
+path = kagglehub.dataset_download("snap/amazon-fine-food-reviews")
+print("Path to dataset files:", path)
+
+#Load the file 
+reviews = pd.read_csv('/root/.cache/kagglehub/datasets/snap/amazon-fine-food-reviews/versions/2/Reviews.csv')
+
+#Remove columns not needed 
+reviews = reviews.drop(['Id', 'UserId', 'ProfileName', 'HelpfulnessNumerator', 'HelpfulnessDenominator','Time'], axis=1)
+reviews = reviews.dropna(subset=['Summary'])
+reviews.head()
+
+## PREPROCESSING MODULE
+
+#Drop Duplicates
+reviews = reviews.drop_duplicates(subset=['Text'])
+
+#convert dataframe into a list
+reviews_list = reviews.values.tolist()
+
+#extract only the review text column as a list for preprocessing
+reviews_text = [row[3] for row in reviews.values.tolist()]
+
+#NLTK resources
+nltk.download('punkt_tab')
+nltk.download('wordnet')
+nltk.download('omw-1.4')
+
+#tools
+wnl = WordNetLemmatizer() #for lemmatisation
+regex_punct = r'[^\w\s]'  #for removing punctuation
+vectorizer = CountVectorizer(stop_words='english') #for removing stopwords
+stopword_set = vectorizer.get_stop_words()
+
+reviews_list = [
+    [
+        row[0],  # product ID
+        row[1],  # score
+        row[2],  # summary
+        [wnl.lemmatize(t.lower()) for t in word_tokenize(row[3])
+         if not re.search(regex_punct, t) and t.lower() not in stopword_set] #text
+    ]
+    for row in tqdm(reviews_list) if isinstance(row[3], str)
+]
+
+#rejoin tokens in row[3] back into strings for index
+for row in reviews_list:
+    row[3] = ' '.join(row[3])
+
+## INDEXING MODULE 
+
+# Define the request body for creating an Elasticsearch index
+request_body = {
+    'settings': {
+        'number_of_shards': 1,  # Set the number of primary shards for the index
+        'number_of_replicas': 1,  # Set the number of replica shards for the index
+        'index': {
+            'refresh_interval': '-1'  # Disable automatic refresh to optimize bulk indexing
+        },
+        'similarity': {
+            'default': {
+                'type': 'BM25',  # Use BM25 similarity algorithm for ranking search results
+                "b": 0.75,  # Controls document field-length normalization, higher value gives more weight to short documents
+                "k1": 1.2  # Controls term frequency saturation, higher value gives more weight to frequent terms
+            }
+        }
+    },
+    'mappings': {
+        'properties': {
+            'productid': {'type': 'keyword'},  # 'productid' is a keyword field (not analyzed, exact match)
+            'summary': {
+                'type': 'text',  # 'summary' is a text field, analyzed for full-text search
+                'fields': {
+                    'keyword': {'type': 'keyword'}  # Create a 'keyword' sub-field for exact matching on 'summary'
+                }
+            },
+            'text': {
+                'type': 'text',  # 'text' field is also analyzed for full-text search
+                'fields': {
+                    'keyword': {'type': 'keyword'}  # Create a 'keyword' sub-field for exact matching on 'text'
+                }
+            },
+            'rating': {'type': 'integer'}  # 'rating' is an integer field (e.g., product ratings)
+        }
+    }
+}
+
+# Define the index name to use in Elasticsearch
+index_name = 'food-reviews'
+
+# Try to check if the index already exists
+try:
+    es.indices.get(index_name)  # Try to fetch the index details
+    print(f'Index {index_name} already exists')  # If it exists, print this message
+except:
+    # If index doesn't exist, create the index with the provided settings and mappings
+    print(f'Creating index {index_name}')
+    es.indices.create(index_name, body=request_body)  # Create the index with the defined request body
+
+# Function to index data
+def gendata():
+    for reviews in reviews_list:
+        yield {
+            '_op_type': 'index',  
+            '_index': index_name,
+            'productid': reviews[0],
+            'summary': reviews[2],
+            'text': reviews[3],
+            'rating': reviews[1],
+        }
+
+# Perform the bulk operation
+success = bulk(es, gendata())
+print(f"Successfully indexed {success} documents.")
+es.indices.refresh(index=index_name)
+
+
+##QUERY PROCESSING MODULE
+
+# Function that outputs the documents relevant to the query 
+def pretty_response(response):
+    if len(response["hits"]["hits"]) == 0:
+        print("Your search returned no results.")
+    else:
+        for hit in response["hits"]["hits"]:
+            # Access the fields from '_source'
+            text = hit["_source"]['text']
+            id = hit["_source"]['productid']
+            summary = hit["_source"]['summary']
+            rating = hit["_source"]["rating"]
+            score = hit["_score"]
+            explanation = hit["_explanation"]
+            pretty_output = f"\nID: {id}\nSummary: {summary}\nScore: {score}\nTitle: {text}\nRating: {rating}\nExplanation: {explanation}\n"
+            print(pretty_output)
+
+# Function of input query finds all documents containing the word match
+def query_body(input,gte):
+    query = {
+        "query": {
+            "bool": {
+                "should": {
+                    "multi_match": {
+                        "query": input,
+                        "type": "most_fields",
+                        "fields": ['summary', 'text^3'],
+                        "fuzziness": "AUTO",
+                    }
+                },
+                "filter": {
+                    "range":{
+                        "rating" :{
+                            "gte":gte
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    return query
+
+
+# Store resuslts of search query & call the function to display results
+query = input("Enter your search query: ")
+gte = 3
+results = es.search(index=index_name ,size=10, body=query_body(query,gte), explain=True)
+pretty_response(results)
+
+
+## EVALUATION
+
+#An input for every hit that we receive, we give it a '1' for relevant and '0' for non relevant
+manual_rels, seen = [], set()
+
+for hit in results["hits"]["hits"]:
+    docid, text = hit["_source"]["productid"], hit["_source"]["text"]
+    if text in seen: continue
+    seen.add(text)
+
+    print(f"\nSummary: {hit['_source']['summary']}\nText: {text}\nProduct ID: {docid}")
+    rel = input("Relevant? (1 = yes, 0 = no): ")
+    while rel not in {'0', '1'}:
+        rel = input("Enter 1 or 0: ")
+    manual_rels.append((docid, int(rel)))
+
+#Precision @ k
+def precision_at_k(retrieved_docs, relevant_docs, k):
+    retrieved_k = retrieved_docs[:k]
+    relevant_count = sum(1 for doc in retrieved_k if doc in relevant_docs)
+    return relevant_count / k
+
+#Recall @ k
+def recall_at_k(retrieved_docs, relevant_docs, k):
+    retrieved_k = retrieved_docs[:k]
+    relevant_count = sum(1 for doc in retrieved_k if doc in relevant_docs)
+    return relevant_count / len(relevant_docs) if relevant_docs else 0
+
+#DCG @ k
+def dcg_at_k(scores, k):
+    return sum((score / np.log2(idx + 2)) for idx, score in enumerate(scores[:k]))
+
+#NDCG @ k
+def ndcg_at_k(retrieved_docs, relevant_docs, k):
+    retrieved_scores = [1 if doc in relevant_docs else 0 for doc in retrieved_docs]
+    ideal_scores = sorted(retrieved_scores, reverse=True)
+
+    dcg = dcg_at_k(retrieved_scores, k)
+    idcg = dcg_at_k(ideal_scores, k)
+
+    return dcg / idcg if idcg > 0 else 0
+        
+doc_scores = [(hit["_source"]["productid"], hit["_score"]) for hit in results["hits"]["hits"]]
+k = 5
+
+#Get Results
+print("Precision@{}: {:.2f}".format(k, precision_at_k(retrieved_docs, relevant_docs, k)))
+print("Recall@{}: {:.2f}".format(k, recall_at_k(retrieved_docs, relevant_docs, k)))
+print("NDCG@{}: {:.2f}".format(k, ndcg_at_k(retrieved_docs, relevant_docs, k)))
+
