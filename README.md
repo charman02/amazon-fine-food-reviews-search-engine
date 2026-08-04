@@ -1,13 +1,30 @@
 # Amazon Fine Food Reviews Search Engine
 
 A BM25 full-text search engine over the [Amazon Fine Food Reviews](https://www.kaggle.com/datasets/snap/amazon-fine-food-reviews)
-dataset (~568K reviews). Enter a free-text query and get back the most relevant reviews, ranked.
-The engine handles text preprocessing (tokenization, stopword removal, lemmatization), indexes the
-corpus in Elasticsearch with BM25 scoring, and includes a small information-retrieval evaluation
-harness (Precision@k, Recall@k, NDCG@k).
+dataset. Enter a free-text query and get back the most relevant reviews, ranked. The engine handles text
+preprocessing (tokenization, stopword removal, lemmatization), indexes the corpus in Elasticsearch with
+BM25 scoring, and includes a small information-retrieval evaluation harness (Precision@k, Recall@k,
+NDCG@k) implemented from scratch.
 
 Built as an information-retrieval project to explore how classic BM25 ranking behaves on a large,
 real-world review corpus.
+
+**At a glance** — measured in the committed notebook run:
+
+| | |
+|---|---|
+| Raw corpus | ~568K reviews (242 MB Kaggle download) |
+| After dedup + null-filtering | **393,576** reviews indexed |
+| Preprocessing throughput | 393,576 docs in **6 m 20 s** (~1,035 docs/sec) |
+| Avg field length | 35.78 tokens (`text`) · 4.09 (`summary`) |
+| Ranking | Elasticsearch **7.9.2** BM25, `k1 = 1.2`, `b = 0.75` |
+| Metrics | Precision@k · Recall@k · DCG@k · NDCG@k, hand-implemented |
+
+Ranking is Elasticsearch's built-in Lucene BM25 — not a reimplementation. The work here is the
+preprocessing pipeline, the index and field mapping, the query design (field-boosted `multi_match` as a
+BM25F approximation), and the from-scratch metrics. See
+[what the committed run actually measured](#what-the-committed-run-actually-measured--and-what-it-didnt)
+for an honest read of the evaluation numbers.
 
 ## Tech Stack
 
@@ -107,17 +124,41 @@ Relevance is judged manually: after a search, you mark each returned hit as rele
 and the metrics are computed over those judgments. This is a lightweight, human-in-the-loop evaluation
 rather than an automated benchmark over a fixed relevance-judged query set.
 
-**Observed behavior:** the engine works well when a query uses broad concepts and vocabulary that
-matches how reviews are actually written; it degrades on highly specific queries where matching terms
-are rare in the corpus.
+### What the committed run actually measured — and what it didn't
+
+The notebook's saved output shows `Precision@5 = Recall@5 = NDCG@5 = 1.00` for the query
+`"best chocolate with rich flavor"`. **Those numbers are not a result, and shouldn't be read as one.**
+Three reasons, all visible in the evaluation cell:
+
+1. `retrieved_docs` and `relevant_docs` are hardcoded to the **same five IDs**, so all three metrics
+   are 1.00 by construction regardless of what the engine returned.
+2. The `manual_rels` list actually collected from the relevance prompts is never passed to the metric
+   functions — it's built and then unused.
+3. The IDs used are `productid`, which is a **product** identifier, not a document identifier. Two
+   distinct reviews of the same product collide (`B000OP5G1E` appears twice in the top 5), so
+   set-membership scoring is measuring the wrong key.
+
+What the run *does* legitimately demonstrate is the retrieval path and the scoring transparency: the
+`explain` output confirms Lucene applying textbook BM25 term-by-term — `idf = log(1 + (N - n + 0.5) /
+(n + 0.5))` over `N = 393,576` documents, `tf` saturating with `k1 = 1.2` and length-normalizing with
+`b = 0.75` against an average field length of `35.78` tokens (`text`) and `4.09` (`summary`).
+
+The intuition that motivated the boost — that IDF dominates on low-frequency terms, so rare or highly
+specific query vocabulary makes ranking brittle — is visible in those per-term explanations, but it is
+**an observation from reading score breakdowns, not a measured finding.** Establishing it would take a
+fixed query set with graded judgments, which is the first item below.
 
 ## Limitations & Possible Extensions
 
-- Evaluation is manual and per-query; a fixed set of graded relevance judgments would make results
-  reproducible and comparable.
+- **The evaluation harness needs to be finished before any quality claim is made.** Concretely: judge
+  on `_id` rather than `productid`, pass the collected `manual_rels` into the metric calls instead of
+  hardcoded lists, and score a fixed set of queries (broad, rare-term, and negation cases) at several
+  values of *k* rather than one query at k=5.
 - The interface is a notebook prompt — a CLI or small web frontend would make it usable as a standalone tool.
 - Ranking is out-of-the-box BM25 with field boosting; learned re-ranking or semantic (embedding) retrieval
   would be natural next steps.
+- `fuzziness: AUTO` is applied to every term, which also lets rare, deliberately-specific query words
+  match near-neighbours — worth measuring against exact matching once the harness above exists.
 
 ## License
 
