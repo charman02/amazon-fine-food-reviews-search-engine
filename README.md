@@ -17,7 +17,8 @@ real-world review corpus.
 | After dedup + null-filtering | **393,576** reviews indexed |
 | Preprocessing throughput | 393,576 docs in **6 m 20 s** (~1,035 docs/sec) |
 | Avg field length | 35.78 tokens (`text`) · 4.09 (`summary`) |
-| Ranking | Elasticsearch **7.9.2** BM25, `k1 = 1.2`, `b = 0.75` |
+| Ranking | Elasticsearch **7.9.2** (Lucene 8.6.2) BM25, `k1 = 1.2`, `b = 0.75` |
+| Index topology | 1 shard, 1 replica — single node, not a distributed deployment |
 | Metrics | Precision@k · Recall@k · DCG@k · NDCG@k, hand-implemented |
 
 Ranking is Elasticsearch's built-in Lucene BM25 — not a reimplementation. The work here is the
@@ -72,7 +73,20 @@ The pipeline runs in five stages, each a section of the notebook:
   doesn't rebuild searchable segments on every write; a manual refresh is issued once the bulk load
   finishes.
 - **Fuzziness for real queries:** review text and search queries are noisy, so `fuzziness: AUTO` lets
-  near-miss spellings still match.
+  near-miss spellings still match. The cost is worth naming: fuzziness applies to *every* term, so a
+  deliberately rare or specific query word can match a near-neighbour instead — the opposite of what a
+  user typing an unusual term wants. Measuring fuzzy against exact matching needs the evaluation harness
+  described below, so this is currently an untested tradeoff rather than a justified one.
+- **Preprocessing the corpus but not the query:** documents are lowercased, stripped of punctuation,
+  tokenized, stopword-filtered and lemmatized before indexing; the query string goes to Elasticsearch
+  as typed and is processed by the field's own analyzer. The two paths therefore differ — a query term
+  that would have been lemmatized away in a document is not lemmatized here. Applying the identical
+  pipeline to both sides is the correct fix.
+- **`rating >= 3` as a hard filter:** results are restricted to positively-rated reviews, which suits
+  "what should I buy" but makes the engine unable to answer "what went wrong with this product." It is
+  a product decision baked into the retrieval layer, where a caller-supplied parameter belongs.
+- **Single shard, single replica:** the index is one shard with one replica on one node
+  (`number_of_shards: 1`). Nothing here exercises sharding, routing, or cross-node query coordination.
 
 ## Running It
 
@@ -92,6 +106,16 @@ run top-to-bottom in **Google Colab**, which has the Linux environment the setup
 
 > **Note:** the notebook stands up a fresh Elasticsearch instance in the runtime and re-indexes the full
 > corpus, so a clean run takes a few minutes (preprocessing ~393K reviews and bulk indexing dominate).
+
+**Reproducibility barriers, so you know before you start:**
+
+| Barrier | Detail |
+|---|---|
+| Kaggle credentials | `kagglehub` needs authentication for the 242 MB dataset download. |
+| Colab-shaped setup | The setup cells assume Linux with `sudo` and a `daemon` user; they will not run as-is on macOS or Windows. |
+| Interactive prompts | Two cells call `input()` — one for the query, one per hit for relevance judgments — so the notebook cannot run unattended end to end. |
+| Startup race | The ES ping cell fails on first execution by design; the next cell sleeps 20 s before retrying. A `ConnectionRefusedError` in the saved output is expected, not a fault. |
+| Pinned versions | `elasticsearch==7.9.1` (client) against server 7.9.2, and `numpy==1.24.3`. Newer clients reject a 7.x server. |
 
 ## Example
 
